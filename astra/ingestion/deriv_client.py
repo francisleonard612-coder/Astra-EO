@@ -195,7 +195,7 @@ class DerivClient:
             await self._ws.close()
 
     async def ensure_connected(self) -> None:
-        if self._ws is None or self._ws.closed:
+        if self._ws is None or self._ws.close_code is not None:
             logger.warning("Reconnecting to Deriv", extra={"extra_fields": {"event_type": "ws_reconnect"}})
             await self.connect()
             # re-subscribe any symbols we were watching
