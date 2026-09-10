@@ -258,9 +258,19 @@ class ArchitectureCompetitionManager:
         outcome_even = 1 if actual_digit % 2 == 0 else 0
         outcome_odd = 1 - outcome_even
 
+        # Same weight source as decision_engine.py::DecisionEngine.evaluate
+        # (see model_agreement's docstring) so the "agreement" metric used
+        # for architecture promotion isn't dominated by a sub-model the
+        # ensemble has already learned to distrust.
+        agreement_weights = {
+            "global": self.global_pipeline.champion_weights,
+            "hybrid": self.hybrid_blend.current_weights(),
+            "specialist": None,
+        }
+
         for arch in ARCHITECTURES:
             vec = pending.vectors[arch]
-            agreement_dict = model_agreement(pending.agreement_inputs[arch])
+            agreement_dict = model_agreement(pending.agreement_inputs[arch], weights=agreement_weights[arch])
             agreement_value = (agreement_dict["even_agreement"] + agreement_dict["odd_agreement"]) / 2.0
             self.metrics[arch].record_prediction(vec, actual_digit, agreement_value)
 
