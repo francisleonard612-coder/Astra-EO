@@ -7,6 +7,7 @@ execution/orders.py).
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from ingestion.deriv_client import DerivClient, DerivRequestError
@@ -30,6 +31,12 @@ class ContractQuote:
 async def get_quote(client: DerivClient, symbol: str, contract_type: str,
                      stake: float, duration: int, duration_unit: str, currency: str,
                      barrier: int | None = None) -> ContractQuote | None:
+    # Defensive re-round at the actual API boundary, independent of whatever
+    # computed `stake` (risk/staking.py already rounds, but this is the one
+    # place that actually talks to Deriv, which hard-rejects >2 decimal
+    # places -- see risk/staking.py's module docstring for how this was
+    # found: martingale progression silently produced e.g. 1.3225).
+    stake = math.floor(stake * 100) / 100
     try:
         proposal = await client.get_proposal(
             symbol=symbol, contract_type=contract_type, barrier=barrier,
