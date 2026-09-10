@@ -419,6 +419,34 @@ Even/Odd (above) does NOT fix this by itself -- it's an unrelated,
 contract-type-agnostic wiring bug that would have affected Over/Under just
 as much; it needed its own fix regardless.
 
+### A third deployment log caught a logging bug that was hiding diagnostic detail
+
+A very short startup-only log (13 lines, ~4 seconds) showed
+`Seeding failed, will build state from live ticks only` at `warn` level --
+but with no `symbol` or `error` detail, even though `seed_symbol()`
+explicitly logs both. The cause: `logging.LoggerAdapter`'s default
+`process()` method *replaces* whatever `extra` dict is passed at a log call
+site with the adapter's own constructor-time `extra`, rather than merging
+them. Since `get_logger()` is used both ways throughout Astra --
+constructor-time context (`get_logger("app.symbol_worker", symbol=symbol)`)
+and per-call detail (`logger.info(msg, extra={"extra_fields": {...}})`) --
+this silently dropped whichever wasn't captured at construction: a plain
+`get_logger(name)` with no constructor kwargs lost every per-call detail
+entirely (exactly what happened here), and a logger with constructor
+kwargs would have kept those but still lost anything passed per-call (tick
+summary details, decision reasons, promotion details, etc.). Reproduced
+directly and fixed with a custom `ExtraFieldsAdapter` that merges instead
+of replacing (`app/logging_setup.py`), covered by
+`tests/test_logging_setup.py`. Also added defense in depth: a seeding
+failure now also gets written to `astra_system_events` in Supabase
+(`seed_symbol` takes a `Repository` now), since seeding happens once in the
+first couple of seconds of startup and is easy to miss in a log export that
+grabs "the last N minutes" rather than literally the start of the container.
+
+This means logs pulled before this fix may be missing detail that's present
+now -- if you see a bare warning/error with no context in an older export,
+that's this bug, not a new mystery.
+
 ### Tick summary logging (debug at a glance)
 
 Every 150 ticks, each symbol worker logs (and persists to

@@ -174,7 +174,8 @@ async def discover_symbols(client: DerivClient, cfg) -> list[str]:
     return symbols
 
 
-async def seed_symbol(client: DerivClient, state_manager: StateManager, symbol: str, count: int = 2000) -> None:
+async def seed_symbol(client: DerivClient, state_manager: StateManager, symbol: str,
+                       repo: Repository, count: int = 2000) -> None:
     try:
         history = await client.get_history(symbol, count=count)
         state_manager.seed(symbol, [t.digit for t in history])
@@ -182,6 +183,11 @@ async def seed_symbol(client: DerivClient, state_manager: StateManager, symbol: 
     except Exception as exc:  # noqa: BLE001
         logger.warning("Seeding failed, will build state from live ticks only",
                         extra={"extra_fields": {"symbol": symbol, "error": str(exc)}})
+        # Also persisted to Supabase, not just the Railway log stream -- so
+        # this is diagnosable even from a log export that misses the
+        # startup window (seeding happens once, in the first couple of
+        # seconds, and is easy to miss when grabbing "the last N minutes").
+        repo.insert_system_event("app.seed_symbol", "seeding_failed", {"symbol": symbol, "error": str(exc)})
 
 
 async def main() -> None:
@@ -241,7 +247,7 @@ async def main() -> None:
 
     decision_engine = DecisionEngine(cfg)
 
-    seed_tasks = [seed_symbol(client, state_manager, s) for s in symbols]
+    seed_tasks = [seed_symbol(client, state_manager, s, repo) for s in symbols]
     await asyncio.gather(*seed_tasks)
 
     workers = []

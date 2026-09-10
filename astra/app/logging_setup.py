@@ -41,6 +41,28 @@ def configure_logging(level: str = "INFO") -> None:
     root.addHandler(handler)
 
 
+class ExtraFieldsAdapter(logging.LoggerAdapter):
+    """logging.LoggerAdapter's default process() REPLACES whatever `extra`
+    dict is passed at the call site with the adapter's own constructor-time
+    `self.extra`, rather than merging them. That silently dropped every
+    per-call `extra={"extra_fields": {...}}` passed to a logger obtained via
+    get_logger() -- confirmed from a live deployment log where a warning
+    ("Seeding failed...") was logged with an explicit `error` and `symbol`
+    detail that never made it to the output, showing only the adapter's own
+    base fields. This subclass merges the two instead, so both the
+    logger's own context (e.g. `symbol=...` set once at get_logger() time)
+    and whatever a specific call passes are preserved."""
+
+    def process(self, msg, kwargs):
+        call_extra = kwargs.get("extra") or {}
+        merged_fields = {
+            **self.extra.get("extra_fields", {}),
+            **call_extra.get("extra_fields", {}),
+        }
+        kwargs["extra"] = {"extra_fields": merged_fields} if merged_fields else {}
+        return msg, kwargs
+
+
 def get_logger(name: str, **extra_fields) -> logging.LoggerAdapter:
     logger = logging.getLogger(name)
-    return logging.LoggerAdapter(logger, {"extra_fields": extra_fields} if extra_fields else {})
+    return ExtraFieldsAdapter(logger, {"extra_fields": extra_fields} if extra_fields else {})
