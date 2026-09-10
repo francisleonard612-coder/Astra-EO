@@ -14,7 +14,24 @@ looking at Astra's own live edge data first.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
+
+# Deriv's proposal API rejects any stake with more than 2 decimal places
+# ("Stake can not have more than 2 decimal places."). A live deployment log
+# showed roughly a third of proposal requests failing this way once
+# martingale progression was enabled: base_stake * progression_factor**step
+# only stays 2-decimal-clean for factor/step combinations that happen to
+# multiply out evenly (e.g. factor=2.0), and silently produces things like
+# 1.15**2 == 1.3225 for anything else. Rounded DOWN (never up) so staking
+# progression can never accidentally stake more than the caller asked for.
+STAKE_DECIMALS = 2
+
+
+def _round_stake(stake: float) -> float:
+    scale = 10 ** STAKE_DECIMALS
+    return math.floor(stake * scale) / scale
+
 
 
 @dataclass
@@ -38,10 +55,10 @@ class StakingEngine:
 
     def current_stake(self, symbol: str) -> float:
         if not self.enabled:
-            return self.base_stake
+            return _round_stake(self.base_stake)
         state = self._get(symbol)
         stake = self.base_stake * (self.progression_factor ** state.step)
-        return min(stake, self.max_stake)
+        return _round_stake(min(stake, self.max_stake))
 
     def record_result(self, symbol: str, won: bool) -> None:
         state = self._get(symbol)
