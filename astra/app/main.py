@@ -39,7 +39,7 @@ logger = get_logger("app.main")
 PREDICTION_LOG_SAMPLE_EVERY_N = 20   # log a NO_TRADE prediction row this often, to keep DB volume sane
 STATE_SNAPSHOT_EVERY_N_TICKS = 200
 MODEL_PERF_LOG_EVERY_N_TICKS = 500
-TICK_SUMMARY_WINDOW = 150            # log a trade/no-trade-reason summary this often, per symbol
+TICK_SUMMARY_LOG_EVERY = 200         # log a CUMULATIVE trade/no-trade-reason summary this often, per symbol
 BALANCE_REFRESH_EVERY_N_TICKS = 200
 
 
@@ -56,7 +56,7 @@ async def symbol_worker(symbol: str, client: DerivClient, state_manager: StateMa
 
     log = get_logger("app.symbol_worker", symbol=symbol)
     log.info("Worker started")
-    tick_summary = TickSummaryTracker(window_size=TICK_SUMMARY_WINDOW)
+    tick_summary = TickSummaryTracker(log_every=TICK_SUMMARY_LOG_EVERY)
 
     while True:
         tick = await queue.get()
@@ -137,7 +137,7 @@ async def symbol_worker(symbol: str, client: DerivClient, state_manager: StateMa
             tick_summary.record_no_trade(decision.reason)
 
         if tick_summary.due():
-            summary = tick_summary.build_and_reset(competition.champion, state.total_observed)
+            summary = tick_summary.build(competition.champion, state.total_observed)
             log.info("Tick summary", extra={"extra_fields": {"event_type": "tick_summary", **summary.__dict__}})
             repo.insert_system_event("app.symbol_worker", "tick_summary", {"symbol": symbol, **summary.__dict__})
 

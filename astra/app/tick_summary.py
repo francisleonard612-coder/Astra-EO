@@ -1,8 +1,14 @@
 """
-Per-symbol rolling tick-outcome summary, logged (and persisted to
-astra_system_events) every `window_size` ticks so a Railway log skim
-answers "is Astra actually trading, and if not, why not" without having to
-query Supabase or manually parse decision.reason strings.
+Per-symbol CUMULATIVE tick-outcome summary, logged (and persisted to
+astra_system_events) every `log_every` ticks so a Railway log skim answers
+"is Astra actually trading, and if not, why not" without having to query
+Supabase or manually parse decision.reason strings.
+
+Counts are never reset: each summary reflects every tick seen since the
+worker started, not just the ticks since the previous log line. That way a
+single "Tick summary" entry at, say, tick 800 already tells the whole story
+(e.g. "0/800 trades, insufficient_edge on 800/800") instead of forcing you to
+add up several independent 150-tick windows in your head to see the trend.
 """
 from __future__ import annotations
 
@@ -31,7 +37,7 @@ def extract_no_trade_reasons(reason: str) -> list[str]:
 
 @dataclass
 class TickSummary:
-    window_ticks: int
+    total_ticks: int
     trades_executed: int
     wins: int
     losses: int
@@ -45,13 +51,16 @@ class TickSummary:
 class TickSummaryTracker:
     """One instance per symbol. Feed it every tick's outcome via
     `record_trade` / `record_risk_blocked` / `record_no_trade`; check
-    `due()` after each tick and call `build_and_reset()` when it fires."""
+    `due()` after each tick and call `build()` when it fires.
 
-    def __init__(self, window_size: int = 150):
-        self.window_size = window_size
-        self._reset()
+    Unlike a windowed tracker, nothing is ever reset -- `build()` just
+    snapshots the running totals. `due()` fires every `log_every` ticks
+    (200 by default) purely to control log/DB write frequency; it has no
+    effect on what the summary contains.
+    """
 
-    def _reset(self) -> None:
+    def __init__(self, log_every: int = 200):
+        self.log_every = log_every
         self.ticks = 0
         self.trades = 0
         self.wins = 0
@@ -79,11 +88,11 @@ class TickSummaryTracker:
             self.pnl += pnl
 
     def due(self) -> bool:
-        return self.ticks >= self.window_size
+        return self.ticks > 0 and self.ticks % self.log_every == 0
 
-    def build_and_reset(self, champion_architecture: str, sample_size: int) -> TickSummary:
-        summary = TickSummary(
-            window_ticks=self.ticks,
+    def build(self, champion_architecture: str, sample_size: int) -> TickSummary:
+        return TickSummary(
+            total_ticks=self.ticks,
             trades_executed=self.trades,
             wins=self.wins,
             losses=self.losses,
@@ -93,5 +102,3 @@ class TickSummaryTracker:
             champion_architecture=champion_architecture,
             sample_size=sample_size,
         )
-        self._reset()
-        return summary
