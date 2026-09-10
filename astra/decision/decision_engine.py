@@ -75,6 +75,7 @@ def evaluate_architecture_decision(
     calibration_even: CalibrationTracker, calibration_odd: CalibrationTracker,
     regime: str, quote_even, quote_odd, sample_size: int,
     mp_cfg: dict, risk_ok: bool, risk_reason: str | None,
+    agreement_weights: dict[str, float | np.ndarray] | None = None,
 ) -> ArchitectureDecision:
     """Pure function: given one architecture's probability vector and a
     shared set of live quotes, runs the exact same mispricing/quality/
@@ -83,8 +84,13 @@ def evaluate_architecture_decision(
     all three competing architectures for a fair comparison -- the only
     thing that differs between architectures is the vector and its own
     calibration/agreement, never the gates themselves.
+
+    `agreement_weights`, when given, should be the SAME per-model trust
+    weights this architecture's own `ensemble_vec` was actually blended
+    with (e.g. SymbolPipeline.champion_weights for "global") -- see
+    models/ensemble.py::model_agreement for why this matters.
     """
-    agreement = model_agreement(predictions_for_agreement)
+    agreement = model_agreement(predictions_for_agreement, weights=agreement_weights)
 
     raw_even = float(np.sum(ensemble_vec[list(EVEN_DIGITS)]))
     raw_odd = float(np.sum(ensemble_vec[list(ODD_DIGITS)]))
@@ -152,12 +158,29 @@ def evaluate_architecture_decision(
         side = None
         decision_label = "NO_TRADE"
         chosen_edge_result = None
-        all_reasons = []
-        for _, _, _, meta in candidates:
-            all_reasons.extend(meta["mispricing_reasons_failed"])
-            all_reasons.extend(meta["abstain_reasons"])
-        reason = ",".join(sorted(set(all_reasons))) if all_reasons else "no_positive_edge"
-        quality_score = max((c[2] for c in candidates), default=None)
+        if candidates:
+            # Report the reasons for whichever side came CLOSEST to trading
+            # (highest expected value), not a union across both sides.
+            # Merging masked genuinely mixed outcomes -- e.g. ODD clearing
+            # every mispricing/quality gate on its own (positive edge,
+            # probability above minimum, positive EV) but still abstaining
+            # because of a regime-level block, while EVEN failed those same
+            # gates outright. A merged reason string made both sides look
+            # equally hopeless; reporting only the closer side's actual
+            # blockers says e.g. "unstable_regime:MODEL_DISAGREEMENT" instead
+            # of implying ODD's edge/probability/EV were bad too. Kept as a
+            # plain comma-joined reason-token list (same format as before)
+            # so tick_summary.extract_no_trade_reasons still parses it as
+            # individual, countable gate names.
+            _, best_edge_result, best_quality_score, best_meta = max(
+                candidates, key=lambda c: c[1].expected_value,
+            )
+            reasons = best_meta["mispricing_reasons_failed"] + best_meta["abstain_reasons"]
+            reason = ",".join(sorted(set(reasons))) if reasons else "no_positive_edge"
+            quality_score = best_quality_score
+        else:
+            reason = "no_positive_edge"
+            quality_score = None
 
     return ArchitectureDecision(
         calibrated_even=calibrated_even, calibrated_odd=calibrated_odd,
@@ -328,7 +351,22 @@ class DecisionEngine:
         # computed correctly elsewhere (evaluate_architecture_decision, for
         # the actual trade-quality gates); this was the one place still
         # hardcoded to Global.
-        champion_agreement_raw = model_agreement(snapshot.agreement_inputs[competition.champion])
+        # Each architecture's OWN currently-live blend weights, so agreement
+        # is scored against what actually produced its ensemble_vec -- not
+        # a naive unweighted std across raw sub-models (see
+        # models/ensemble.py::model_agreement docstring). "specialist" has
+        # no single natural per-model trust weight (its two components
+        # aren't blended via a weight dict), so it falls back to unweighted.
+        agreement_weights = {
+            "global": competition.global_pipeline.champion_weights,
+            "hybrid": competition.hybrid_blend.current_weights(),
+            "specialist": None,
+        }
+
+        champion_agreement_raw = model_agreement(
+            snapshot.agreement_inputs[competition.champion],
+            weights=agreement_weights[competition.champion],
+        )
         avg_model_std = (champion_agreement_raw["even_std"] + champion_agreement_raw["odd_std"]) / 2.0
         regime_result = self.regime_detector.detect(snapshot.bundle, avg_model_std)
         regime = regime_result.regime
@@ -350,6 +388,7 @@ class DecisionEngine:
             regime=regime, quote_even=quote_even, quote_odd=quote_odd,
             sample_size=state.total_observed,
             mp_cfg=self.mp_cfg, risk_ok=risk_ok, risk_reason=risk_reason,
+            agreement_weights=agreement_weights[competition.champion],
         )
 
         # Shadow-evaluate the other two architectures against the SAME
@@ -367,6 +406,7 @@ class DecisionEngine:
                 regime=regime, quote_even=quote_even, quote_odd=quote_odd,
                 sample_size=state.total_observed,
                 mp_cfg=self.mp_cfg, risk_ok=risk_ok, risk_reason=risk_reason,
+                agreement_weights=agreement_weights[arch],
             )
 
         stake_out = stake if champion_decision.side is not None else None
