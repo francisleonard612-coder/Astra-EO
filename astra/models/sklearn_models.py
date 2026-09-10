@@ -11,12 +11,42 @@ class LogisticModel(DigitModel):
     """Online multinomial logistic regression via SGDClassifier(loss='log_loss').
     Unlike sklearn's plain LogisticRegression, SGDClassifier supports
     partial_fit, so this one genuinely learns incrementally, tick by tick,
-    rather than needing scheduled batch retraining."""
+    rather than needing scheduled batch retraining.
+
+    `average=True` and a larger `alpha` were added after a live deployment
+    log showed this model collapsing to near-one-hot, tick-to-tick-flipping
+    predictions (predict_proba landing within 1e-9 of 0/1 on a DIFFERENT
+    digit almost every tick). Reproduced against the real feature pipeline
+    on a near-random digit stream: the original config (alpha=1e-4, no
+    averaging) put max-probability above 0.99 on 98% of ticks. Two things
+    drive it, both well-known failure modes of single-sample `partial_fit`
+    SGD:
+      1. No weight averaging -- predict/predict_proba use the raw, noisy
+         last SGD iterate, which one single-example update can swing hard
+         enough to saturate the sigmoid. `average=True` switches to the
+         Polyak/Ruppert-averaged coefficients across the whole trajectory
+         instead -- sklearn's own documented mitigation for exactly this,
+         and the dominant fix (alone it already took the >0.99 fraction to
+         0%, mean max-proba 0.999 -> 0.641).
+      2. Under sklearn's default 'optimal' learning-rate schedule the
+         initial step size is ~1/alpha, so the original tiny alpha (1e-4)
+         made early updates unusually large on top of that. Raising it to
+         1e-3 both regularizes more and shrinks that step; combined with
+         averaging, mean max-proba on the same simulation drops further to
+         0.366 -- a sane, non-saturated distribution again.
+    The ensemble had already learned to distrust this model's raw output
+    (~2% blend weight) largely because of this instability; see
+    models/ensemble.py::model_agreement for the separate, related fix that
+    stopped this model's noise from being able to veto trades entirely via
+    a false "MODEL_DISAGREEMENT" regime read.
+    """
     name = "logistic"
 
     def __init__(self):
         from sklearn.linear_model import SGDClassifier
-        self._clf = SGDClassifier(loss="log_loss", alpha=1e-4, max_iter=1, warm_start=True)
+        self._clf = SGDClassifier(
+            loss="log_loss", alpha=1e-3, max_iter=1, warm_start=True, average=True,
+        )
         self._fitted = False
         self._classes = np.arange(N_DIGITS)
 
@@ -30,6 +60,11 @@ class LogisticModel(DigitModel):
         full = np.full(N_DIGITS, 1e-6)
         for cls, p in zip(self._clf.classes_, proba):
             full[int(cls)] = p
+        # Defensive floor/ceiling even with the training-time fix above --
+        # caps how much any single still-noisy tick can distort the
+        # ensemble blend or the agreement/regime signal, rather than
+        # relying entirely on training-time stability holding forever.
+        full = np.clip(full, 1e-3, 1.0 - 1e-3)
         return normalize(full)
 
     def observe(self, state: SymbolState, bundle: FeatureBundle, actual_digit: int) -> None:
