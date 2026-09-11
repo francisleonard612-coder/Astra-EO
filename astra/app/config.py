@@ -90,6 +90,7 @@ class RiskOverrides:
     max_daily_loss: float = field(default_factory=lambda: _env_float("MAX_DAILY_LOSS", 25.0))
     max_trades_per_day: int = field(default_factory=lambda: _env_int("MAX_TRADES_PER_DAY", 500))
     max_concurrent_trades: int = field(default_factory=lambda: _env_int("MAX_CONCURRENT_TRADES", 2))
+    min_seconds_between_trades: float = field(default_factory=lambda: _env_float("MIN_SECONDS_BETWEEN_TRADES", 5.0))
     martingale_enabled: bool = field(default_factory=lambda: _env_bool("MARTINGALE_ENABLED", False))
     martingale_factor: float = field(default_factory=lambda: _env_float("MARTINGALE_FACTOR", 2.0))
     martingale_max_steps: int = field(default_factory=lambda: _env_int("MARTINGALE_MAX_STEPS", 3))
@@ -120,6 +121,7 @@ class AstraConfig:
         self.raw["risk"]["max_daily_loss"] = self.risk_overrides.max_daily_loss
         self.raw["risk"]["max_trades_per_day"] = self.risk_overrides.max_trades_per_day
         self.raw["risk"]["max_concurrent_trades"] = self.risk_overrides.max_concurrent_trades
+        self.raw["risk"]["min_seconds_between_trades"] = self.risk_overrides.min_seconds_between_trades
         self.raw["risk"].setdefault("staking", {})
         self.raw["risk"]["staking"]["enabled"] = self.risk_overrides.martingale_enabled
         self.raw["risk"]["staking"]["progression_factor"] = self.risk_overrides.martingale_factor
