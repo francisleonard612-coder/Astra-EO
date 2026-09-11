@@ -52,6 +52,31 @@ def test_architecture_learns_a_biased_digit():
     assert vec[9] > 0.15
 
 
+def test_logistic_probability_does_not_saturate_on_random_digits():
+    """Regression test for a live-deployment bug: this per-digit online SGD
+    (alpha=1e-4, no weight averaging) saturated near 0/1 on ~91% of ticks
+    against a genuinely random digit stream when it should hover near this
+    digit's true base rate. average=True + a larger alpha should keep it in
+    a sane range."""
+    spec = DigitSpecialist(digit=4)
+    rng = np.random.default_rng(3)
+    vals = []
+    for _ in range(600):
+        fv = rng.normal(0, 0.2, 81)
+        d = int(rng.integers(0, 10))
+        if spec._fitted:
+            p = spec.logistic_probability(fv)
+            if p is not None:
+                vals.append(p)
+        spec.observe(fv, d)
+
+    tail = vals[-300:]
+    assert tail
+    frac_saturated = sum(1 for p in tail if p > 0.99 or p < 0.01) / len(tail)
+    assert frac_saturated < 0.2
+    assert all(0.0 < p < 1.0 for p in vals)
+
+
 def test_components_are_exposed_separately_for_agreement_scoring():
     arch = DigitSpecialistArchitecture()
     sm = StateManager(max_window=200)
