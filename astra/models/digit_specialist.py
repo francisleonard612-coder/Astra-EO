@@ -49,7 +49,21 @@ class DigitSpecialist:
     def _ensure_logistic(self):
         if self._logistic is None:
             from sklearn.linear_model import SGDClassifier
-            self._logistic = SGDClassifier(loss="log_loss", alpha=1e-4, max_iter=1, warm_start=True)
+            # See models/sklearn_models.py::LogisticModel for the full
+            # writeup of this exact instability and how it was found: a live
+            # deployment log showed this model's counterpart there emitting
+            # near one-hot predictions almost every tick under
+            # alpha=1e-4/no averaging. Reproduced here too -- this per-digit
+            # classifier saturated near 0/1 on 90.7% of ticks against a
+            # synthetic random digit stream, when it should hover near this
+            # digit's true base rate. Same fix: average=True (Polyak/Ruppert
+            # averaging of the SGD trajectory instead of the raw noisy last
+            # iterate) plus a larger alpha (also shrinks the initial step
+            # size, since sklearn's default 'optimal' schedule scales it
+            # ~1/alpha).
+            self._logistic = SGDClassifier(
+                loss="log_loss", alpha=1e-3, max_iter=1, warm_start=True, average=True,
+            )
 
     def bayes_probability(self) -> float:
         return self._alpha / (self._alpha + self._beta)
@@ -61,9 +75,13 @@ class DigitSpecialist:
         try:
             proba = self._logistic.predict_proba(feature_vector.reshape(1, -1))[0]
             classes = self._logistic.classes_
-            return float(proba[list(classes).index(1)]) if 1 in classes else 0.0
+            p = float(proba[list(classes).index(1)]) if 1 in classes else 0.0
         except Exception:  # noqa: BLE001
             return None
+        # Defensive floor/ceiling even with the training-time fix above --
+        # see models/sklearn_models.py::LogisticModel for why this matters
+        # even after average=True.
+        return min(max(p, 1e-3), 1.0 - 1e-3)
 
     def predict_probability(self, feature_vector: np.ndarray | None) -> float:
         bayes_p = self.bayes_probability()
