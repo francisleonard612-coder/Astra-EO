@@ -25,12 +25,14 @@ class RiskState:
     emergency_stop: bool = False
     connection_ok: bool = True
     open_trades: int = 0  # currently OPEN (bought, not yet settled) contracts, across every symbol
+    last_trade_time: float | None = None  # wall-clock time of the last reserved trade slot, across every symbol
 
 
 class RiskEngine:
     def __init__(self, base_stake: float, max_stake: float, max_consecutive_losses: int,
                  max_daily_loss: float, max_drawdown: float, max_trades_per_day: int,
-                 cooldown_seconds_after_max_losses: int, max_concurrent_trades: int = 2):
+                 cooldown_seconds_after_max_losses: int, max_concurrent_trades: int = 2,
+                 min_seconds_between_trades: float = 0.0):
         self.base_stake = base_stake
         self.max_stake = max_stake
         self.max_consecutive_losses = max_consecutive_losses
@@ -39,6 +41,19 @@ class RiskEngine:
         self.max_trades_per_day = max_trades_per_day
         self.cooldown_seconds = cooldown_seconds_after_max_losses
         self.max_concurrent_trades = max_concurrent_trades
+        # Pure pacing, unrelated to the punitive cooldown_seconds above (that
+        # one only kicks in after max_consecutive_losses and exists to force
+        # a pause after a bad run). This one applies to every trade, win or
+        # lose, purely to stop the bot from firing on every single eligible
+        # tick back-to-back -- with ~1 tick/second symbols and 2-tick
+        # contracts, "eligible" can otherwise mean "immediately, then again
+        # the instant the previous contract settles". A live deployment's
+        # trade table showed exactly that: new positions opening 1-2 seconds
+        # after the previous one settled, repeatedly. This is a single
+        # global pacing floor across every symbol (like max_concurrent_trades
+        # above), not per-symbol -- it governs the account's overall trade
+        # cadence, not any one market's.
+        self.min_seconds_between_trades = min_seconds_between_trades
         self.state = RiskState()
 
     def _roll_day_if_needed(self) -> None:
@@ -73,6 +88,9 @@ class RiskEngine:
             return False, "connection_failure_stop"
         if self.state.cooldown_until and time.time() < self.state.cooldown_until:
             return False, "cooldown_active"
+        if (self.min_seconds_between_trades > 0 and self.state.last_trade_time is not None
+                and time.time() - self.state.last_trade_time < self.min_seconds_between_trades):
+            return False, "trade_pacing_cooldown"
         if stake > self.max_stake:
             return False, "stake_exceeds_max_stake"
         if self.state.consecutive_losses >= self.max_consecutive_losses:
@@ -102,7 +120,8 @@ class RiskEngine:
             self.state.consecutive_losses = 0
 
     def reserve_trade_slot(self) -> None:
-        """Claim one of the `max_concurrent_trades` open-trade slots.
+        """Claim one of the `max_concurrent_trades` open-trade slots, and
+        stamp the trade-pacing clock used by `min_seconds_between_trades`.
 
         MUST be called synchronously, immediately after `check()` passes and
         BEFORE any `await` (i.e. before the actual buy request goes out) --
@@ -113,6 +132,7 @@ class RiskEngine:
         in a try/finally, so a slot can never leak.
         """
         self.state.open_trades += 1
+        self.state.last_trade_time = time.time()
 
     def release_trade_slot(self) -> None:
         self.state.open_trades = max(0, self.state.open_trades - 1)
