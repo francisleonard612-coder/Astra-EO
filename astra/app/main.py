@@ -63,141 +63,106 @@ async def symbol_worker(symbol: str, client: DerivClient, state_manager: StateMa
         tick = await queue.get()
         tick_count += 1
 
-        # Everything below processes ONE tick. It must never be allowed to
-        # raise out of this loop: an uncaught exception here (e.g. a Deriv
-        # request timeout, a transient Supabase write failure, ...) would
-        # kill this asyncio.Task silently -- nothing awaits/retrieves these
-        # worker tasks, so the task just vanishes with no log line. The
-        # ingestion side (_recv_pump / _route_tick in ingestion/deriv_client.py)
-        # keeps running and keeps enqueueing ticks regardless, so the
-        # symptom shows up minutes later as "Tick queue full, dropping tick"
-        # once the queue -- which nothing is draining anymore -- fills up.
-        # Catching here keeps this worker consuming so the queue can never
-        # back up in the first place; see also the done-callback on task
-        # creation below, which is the backstop for anything that still
-        # escapes (e.g. a bug in this except block itself).
-        try:
-            await _process_tick(
-                tick, tick_count, symbol, client, state, competition, decision_engine, repo,
-                risk_engine, staking, retraining, tick_summary, cfg, currency, duration,
-                duration_unit, log,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            log.error("Tick processing failed, dropping this tick and continuing", exc_info=exc,
-                      extra={"extra_fields": {"event_type": "tick_processing_error", "tick_count": tick_count}})
-            repo.insert_system_event("app.symbol_worker", "tick_processing_error",
-                                      {"symbol": symbol, "error": str(exc)})
+        # Learn from the PREVIOUS tick's prediction now that this tick's
+        # digit has settled -- across all 3 architectures at once (see
+        # ArchitectureCompetitionManager.observe_pending). This must happen
+        # BEFORE state.push() below, using state as it was at prediction
+        # time, and BEFORE decision_engine.evaluate() overwrites the
+        # competition's pending snapshot with a fresh one for the next tick.
+        if competition.has_pending():
+            competition.observe_pending(state, tick.digit)
 
+        state.push(tick.digit)
+        if cfg.get("database", "persist_ticks", default=True):
+            repo.insert_tick(symbol, tick.epoch, tick.quote, tick.digit)
 
-async def _process_tick(tick, tick_count: int, symbol: str, client: DerivClient, state,
-                         competition: ArchitectureCompetitionManager,
-                         decision_engine: DecisionEngine, repo: Repository, risk_engine: RiskEngine,
-                         staking: StakingEngine, retraining: RetrainingController,
-                         tick_summary: TickSummaryTracker, cfg, currency: str, duration: int,
-                         duration_unit: str, log) -> None:
+        if tick_count % BALANCE_REFRESH_EVERY_N_TICKS == 0:
+            try:
+                balance = await client.get_balance()
+                if balance and "balance" in balance:
+                    risk_engine.set_equity(float(balance["balance"]))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Balance refresh failed", extra={"extra_fields": {"error": str(exc)}})
 
-    # Learn from the PREVIOUS tick's prediction now that this tick's
-    # digit has settled -- across all 3 architectures at once (see
-    # ArchitectureCompetitionManager.observe_pending). This must happen
-    # BEFORE state.push() below, using state as it was at prediction
-    # time, and BEFORE decision_engine.evaluate() overwrites the
-    # competition's pending snapshot with a fresh one for the next tick.
-    if competition.has_pending():
-        competition.observe_pending(state, tick.digit)
+        stake = staking.current_stake(symbol)
+        risk_ok, risk_reason = risk_engine.check(stake)
 
-    state.push(tick.digit)
-    if cfg.get("database", "persist_ticks", default=True):
-        repo.insert_tick(symbol, tick.epoch, tick.quote, tick.digit)
-
-    if tick_count % BALANCE_REFRESH_EVERY_N_TICKS == 0:
-        try:
-            balance = await client.get_balance()
-            if balance and "balance" in balance:
-                risk_engine.set_equity(float(balance["balance"]))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Balance refresh failed", extra={"extra_fields": {"error": str(exc)}})
-
-    stake = staking.current_stake(symbol)
-    risk_ok, risk_reason = risk_engine.check(stake)
-
-    # This call also runs predict_all() + stashes a fresh pending
-    # snapshot (all 3 architectures) for the NEXT tick's observe_pending
-    # -- see decision_engine.py::DecisionEngine.evaluate() for why this
-    # happens unconditionally, before any trade-eligibility gating.
-    decision = await decision_engine.evaluate(
-        client, state, competition, stake=stake, currency=currency, risk_ok=risk_ok, risk_reason=risk_reason,
-    )
-
-    should_log_prediction = decision.decision != "NO_TRADE" or tick_count % PREDICTION_LOG_SAMPLE_EVERY_N == 0
-    prediction_id = repo.insert_prediction(decision) if should_log_prediction else None
-
-    if decision.decision != "NO_TRADE" and risk_ok:
-        log.info("Executing trade", extra={"extra_fields": {
-            "decision": decision.decision, "reason": decision.reason, "quality": decision.quality_score,
-            "architecture": decision.architecture,
-        }})
-        # Claim a concurrent-trade slot synchronously (no `await` between
-        # the risk_ok check above and this reservation), then always
-        # release it once settled/failed -- see RiskEngine.reserve_trade_slot
-        # docstring for why the ordering matters under asyncio.
-        risk_engine.reserve_trade_slot()
-        try:
-            trade_result = await execute_decision(
-                client, decision, currency=currency, duration=duration, duration_unit=duration_unit,
-                dry_run=cfg.dry_run,
-            )
-        finally:
-            risk_engine.release_trade_slot()
-
-        if trade_result is not None:
-            repo.insert_trade(trade_result, prediction_id)
-            if trade_result.pnl is not None:
-                risk_engine.record_trade_result(trade_result.pnl)
-                staking.record_result(symbol, bool(trade_result.won))
-            if trade_result.error:
-                log.warning("Trade did not settle cleanly", extra={"extra_fields": {"error": trade_result.error}})
-            tick_summary.record_trade(trade_result.won, trade_result.pnl)
-        else:
-            # decided to trade, but no order could even be placed (e.g.
-            # quote unavailable at execution time) -- still an attempt,
-            # not a decision-engine "no trade", so it's still counted as
-            # a trade with an unknown outcome for the summary below.
-            tick_summary.record_trade(None, None)
-    elif decision.decision != "NO_TRADE" and not risk_ok:
-        log.info("Trade blocked by risk engine", extra={"extra_fields": {"reason": risk_reason}})
-        repo.insert_risk_event(symbol, "trade_blocked", {"reason": risk_reason, "decision": decision.decision})
-        tick_summary.record_risk_blocked(risk_reason)
-    else:
-        tick_summary.record_no_trade(decision.reason)
-
-    if tick_summary.due():
-        summary = tick_summary.build(competition.champion, state.total_observed)
-        log.info("Tick summary", extra={"extra_fields": {"event_type": "tick_summary", **summary.__dict__}})
-        repo.insert_system_event("app.symbol_worker", "tick_summary", {"symbol": symbol, **summary.__dict__})
-
-    retraining.maybe_retrain(symbol, competition.global_pipeline.registry)
-
-    if tick_count % STATE_SNAPSHOT_EVERY_N_TICKS == 0:
-        gp = competition.global_pipeline
-        repo.save_symbol_state(
-            symbol, state.total_observed, list(state.digits)[-2000:],
-            {k: v.tolist() for k, v in gp.champion_weights.items()},
-            {k: v.tolist() for k, v in gp.performance.current_weights().items()},
+        # This call also runs predict_all() + stashes a fresh pending
+        # snapshot (all 3 architectures) for the NEXT tick's observe_pending
+        # -- see decision_engine.py::DecisionEngine.evaluate() for why this
+        # happens unconditionally, before any trade-eligibility gating.
+        decision = await decision_engine.evaluate(
+            client, state, competition, stake=stake, currency=currency, risk_ok=risk_ok, risk_reason=risk_reason,
         )
 
-    if tick_count % MODEL_PERF_LOG_EVERY_N_TICKS == 0:
-        gp = competition.global_pipeline
-        for name in gp.registry.models:
-            repo.insert_model_performance(
-                symbol, name, gp.performance.rolling_log_loss(name), gp.champion_weights.get(name),
+        should_log_prediction = decision.decision != "NO_TRADE" or tick_count % PREDICTION_LOG_SAMPLE_EVERY_N == 0
+        prediction_id = repo.insert_prediction(decision) if should_log_prediction else None
+
+        if decision.decision != "NO_TRADE" and risk_ok:
+            log.info("Executing trade", extra={"extra_fields": {
+                "decision": decision.decision, "reason": decision.reason, "quality": decision.quality_score,
+                "architecture": decision.architecture,
+            }})
+            # Claim a concurrent-trade slot synchronously (no `await` between
+            # the risk_ok check above and this reservation), then always
+            # release it once settled/failed -- see RiskEngine.reserve_trade_slot
+            # docstring for why the ordering matters under asyncio.
+            risk_engine.reserve_trade_slot()
+            try:
+                trade_result = await execute_decision(
+                    client, decision, currency=currency, duration=duration, duration_unit=duration_unit,
+                    dry_run=cfg.dry_run,
+                )
+            finally:
+                risk_engine.release_trade_slot()
+
+            if trade_result is not None:
+                repo.insert_trade(trade_result, prediction_id)
+                if trade_result.pnl is not None:
+                    risk_engine.record_trade_result(trade_result.pnl)
+                    staking.record_result(symbol, bool(trade_result.won))
+                if trade_result.error:
+                    log.warning("Trade did not settle cleanly", extra={"extra_fields": {"error": trade_result.error}})
+                tick_summary.record_trade(trade_result.won, trade_result.pnl)
+            else:
+                # decided to trade, but no order could even be placed (e.g.
+                # quote unavailable at execution time) -- still an attempt,
+                # not a decision-engine "no trade", so it's still counted as
+                # a trade with an unknown outcome for the summary below.
+                tick_summary.record_trade(None, None)
+        elif decision.decision != "NO_TRADE" and not risk_ok:
+            log.info("Trade blocked by risk engine", extra={"extra_fields": {"reason": risk_reason}})
+            repo.insert_risk_event(symbol, "trade_blocked", {"reason": risk_reason, "decision": decision.decision})
+            tick_summary.record_risk_blocked(risk_reason)
+        else:
+            tick_summary.record_no_trade(decision.reason)
+
+        if tick_summary.due():
+            summary = tick_summary.build(competition.champion, state.total_observed)
+            log.info("Tick summary", extra={"extra_fields": {"event_type": "tick_summary", **summary.__dict__}})
+            repo.insert_system_event("app.symbol_worker", "tick_summary", {"symbol": symbol, **summary.__dict__})
+
+        retraining.maybe_retrain(symbol, competition.global_pipeline.registry)
+
+        if tick_count % STATE_SNAPSHOT_EVERY_N_TICKS == 0:
+            gp = competition.global_pipeline
+            repo.save_symbol_state(
+                symbol, state.total_observed, list(state.digits)[-2000:],
+                {k: v.tolist() for k, v in gp.champion_weights.items()},
+                {k: v.tolist() for k, v in gp.performance.current_weights().items()},
             )
-        for arch in ARCHITECTURES:
-            summary = competition.metrics[arch].summary()
-            cal = competition.calibration[arch]
-            summary["calibration"] = (cal["over"].quality_score() + cal["under"].quality_score()) / 2.0
-            repo.insert_architecture_performance(symbol, arch, summary)
+
+        if tick_count % MODEL_PERF_LOG_EVERY_N_TICKS == 0:
+            gp = competition.global_pipeline
+            for name in gp.registry.models:
+                repo.insert_model_performance(
+                    symbol, name, gp.performance.rolling_log_loss(name), gp.champion_weights.get(name),
+                )
+            for arch in ARCHITECTURES:
+                summary = competition.metrics[arch].summary()
+                cal = competition.calibration[arch]
+                summary["calibration"] = (cal["even"].quality_score() + cal["odd"].quality_score()) / 2.0
+                repo.insert_architecture_performance(symbol, arch, summary)
 
 
 async def discover_symbols(client: DerivClient, cfg) -> list[str]:
@@ -267,6 +232,7 @@ async def main() -> None:
         max_trades_per_day=risk_cfg.get("max_trades_per_day", 500),
         cooldown_seconds_after_max_losses=risk_cfg.get("cooldown_seconds_after_max_losses", 900),
         max_concurrent_trades=risk_cfg.get("max_concurrent_trades", 2),
+        min_seconds_between_trades=risk_cfg.get("min_seconds_between_trades", 5.0),
     )
     staking_cfg = risk_cfg.get("staking", {})
     staking = StakingEngine(
@@ -286,30 +252,15 @@ async def main() -> None:
     seed_tasks = [seed_symbol(client, state_manager, s, repo) for s in symbols]
     await asyncio.gather(*seed_tasks)
 
-    def _log_worker_death(task: asyncio.Task) -> None:
-        # Backstop for symbol_worker() itself, so a worker task can never
-        # disappear silently -- see the try/except inside symbol_worker's
-        # loop for the primary fix (this only fires for something that
-        # escapes that, e.g. a bug in the except block, or the initial
-        # `client.subscribe_ticks(symbol)` call before the loop starts).
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            logger.error(f"Worker task {task.get_name()} died", exc_info=exc,
-                         extra={"extra_fields": {"event_type": "worker_task_died", "task": task.get_name()}})
-
     workers = []
     for symbol in symbols:
         repo.upsert_symbol(symbol)
         competition = ArchitectureCompetitionManager(symbol, cfg, repository=repo)
-        task = asyncio.create_task(
+        workers.append(asyncio.create_task(
             symbol_worker(symbol, client, state_manager, competition, decision_engine, repo,
                           risk_engine, staking, retraining, cfg),
             name=f"worker-{symbol}",
-        )
-        task.add_done_callback(_log_worker_death)
-        workers.append(task)
+        ))
 
     stop_event = asyncio.Event()
 
