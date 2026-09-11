@@ -198,10 +198,13 @@ class DerivClient:
         if self._ws is None or self._ws.close_code is not None:
             logger.warning("Reconnecting to Deriv", extra={"extra_fields": {"event_type": "ws_reconnect"}})
             await self.connect()
-            # re-subscribe any symbols we were watching
-            for symbol in list(self._subscription_ids.keys()):
-                self._subscription_ids.pop(symbol, None)
-                await self._resubscribe(symbol)
+            await self._resubscribe_all()
+
+    async def _resubscribe_all(self) -> None:
+        # re-subscribe any symbols we were watching
+        for symbol in list(self._subscription_ids.keys()):
+            self._subscription_ids.pop(symbol, None)
+            await self._resubscribe(symbol)
 
     async def _resubscribe(self, symbol: str) -> None:
         queue = self._tick_queues.get(symbol)
@@ -271,6 +274,44 @@ class DerivClient:
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(exc)
+            # Without this, a crash here (e.g. the connection dropping) used
+            # to just end this task with nothing to replace it: every
+            # symbol_worker's `await queue.get()` would then hang forever
+            # with no more ticks ever arriving, while the process itself
+            # kept running and looked "alive" -- caught from a live
+            # deployment log where all activity stopped dead at exactly this
+            # event, with nothing logged afterwards. `ensure_connected()`
+            # isn't used for the recovery itself (only for the resubscribe
+            # helper): it no-ops if `self._ws.close_code` doesn't happen to
+            # reflect the crash (true for a genuine connection drop, not
+            # guaranteed for some other bug raised inside this loop), so
+            # this always forces a full reconnect regardless of what
+            # `self._ws` currently looks like.
+            if not self._closed:
+                await self._recover_from_recv_pump_crash(exc)
+
+    async def _recover_from_recv_pump_crash(self, original_exc: Exception, max_attempts: int = 5) -> None:
+        delay = 1.0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await self.connect()
+                await self._resubscribe_all()
+                logger.info("Reconnected after recv pump crash", extra={"extra_fields": {
+                    "event_type": "recv_pump_recovered", "attempt": attempt,
+                }})
+                return
+            except Exception as reconnect_exc:  # noqa: BLE001
+                logger.warning("Reconnect attempt after recv pump crash failed", extra={"extra_fields": {
+                    "event_type": "recv_pump_reconnect_failed", "attempt": attempt, "error": str(reconnect_exc),
+                }})
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
+        logger.error(
+            "Giving up reconnecting after recv pump crash -- ticks will stop until the process is restarted",
+            extra={"extra_fields": {
+                "event_type": "recv_pump_recovery_exhausted", "original_error": str(original_exc),
+            }},
+        )
 
     def _route_tick(self, msg: dict) -> None:
         tick = msg.get("tick")
